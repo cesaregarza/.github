@@ -1,0 +1,40 @@
+name: Build DOCR Image
+description: Build and optionally push a Docker image using GitHub Actions cache.
+
+inputs:
+  context:
+    required: false
+    default: .
+  file:
+    required: true
+  push:
+    required: false
+    default: "true"
+  tags:
+    description: Newline-separated Docker image tags.
+    required: true
+  build-args:
+    description: Newline-separated Docker build arguments.
+    required: false
+    default: ""
+
+outputs:
+  digest:
+    description: Image digest from docker/build-push-action.
+    value: ${{ steps.build.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Build and push image
+      id: build
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
+        push: ${{ inputs.push }}
+        tags: ${{ inputs.tags }}
+        build-args: ${{ inputs.build-args }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+

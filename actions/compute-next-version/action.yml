@@ -1,0 +1,97 @@
+name: Compute Next Version
+description: Read a base semver file and compute the next release version.
+
+inputs:
+  version-file:
+    description: File containing the base semantic version.
+    required: false
+    default: .version
+  github-token:
+    description: Token used to read the latest GitHub release.
+    required: true
+  tag-prefix:
+    description: Prefix for the tag output.
+    required: false
+    default: v
+
+outputs:
+  version:
+    description: Next version without tag prefix.
+    value: ${{ steps.next.outputs.version }}
+  tag:
+    description: Next tag with prefix.
+    value: ${{ steps.next.outputs.tag }}
+  latest-tag:
+    description: Latest release tag found in GitHub.
+    value: ${{ steps.latest.outputs.tag }}
+
+runs:
+  using: composite
+  steps:
+    - name: Read base version
+      id: base
+      shell: bash
+      run: |
+        set -euo pipefail
+        version="$(tr -d '[:space:]' < "${{ inputs.version-file }}")"
+        if ! printf '%s' "$version" | grep -Eq '^v?\.?[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "Expected semver in ${{ inputs.version-file }}, got: $version" >&2
+          exit 1
+        fi
+        version="${version#v}"
+        version="${version#.}"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Get latest release tag
+      id: latest
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        tag="$(gh release view --json tagName -q .tagName 2>/dev/null || true)"
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+    - name: Compute next version
+      id: next
+      shell: bash
+      env:
+        BASE_VERSION: ${{ steps.base.outputs.version }}
+        LATEST_TAG: ${{ steps.latest.outputs.tag }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+      run: |
+        set -euo pipefail
+
+        normalize() {
+          local raw="${1:-0.0.0}"
+          raw="${raw#v}"
+          raw="${raw#.}"
+          IFS=. read -r major minor patch _rest <<< "$raw"
+          printf '%s.%s.%s' "${major:-0}" "${minor:-0}" "${patch:-0}"
+        }
+
+        greater_than() {
+          local left right
+          left="$(normalize "$1")"
+          right="$(normalize "$2")"
+          IFS=. read -r lm li lp <<< "$left"
+          IFS=. read -r rm ri rp <<< "$right"
+          if (( lm > rm )); then return 0; fi
+          if (( lm < rm )); then return 1; fi
+          if (( li > ri )); then return 0; fi
+          if (( li < ri )); then return 1; fi
+          (( lp > rp ))
+        }
+
+        base="$(normalize "$BASE_VERSION")"
+        latest="$(normalize "$LATEST_TAG")"
+        if greater_than "$base" "$latest"; then
+          next="$base"
+        else
+          IFS=. read -r major minor patch <<< "$latest"
+          next="${major}.${minor}.$((patch + 1))"
+        fi
+
+        echo "version=$next" >> "$GITHUB_OUTPUT"
+        echo "tag=${TAG_PREFIX}${next}" >> "$GITHUB_OUTPUT"
+

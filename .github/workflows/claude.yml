@@ -1,0 +1,54 @@
+name: Claude Code
+
+on:
+  workflow_call:
+    inputs:
+      trigger_phrase:
+        description: Phrase that triggers Claude from issue and PR comments.
+        required: false
+        type: string
+        default: "@claude"
+      fetch_depth:
+        description: Checkout fetch depth.
+        required: false
+        type: number
+        default: 1
+      claude_args:
+        description: Optional arguments passed to Claude Code.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  id-token: write
+  actions: read
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, inputs.trigger_phrase)) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, inputs.trigger_phrase)) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, inputs.trigger_phrase)) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, inputs.trigger_phrase) || contains(github.event.issue.title, inputs.trigger_phrase)))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: ${{ inputs.fetch_depth }}
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          claude_args: ${{ inputs.claude_args }}
+

@@ -1,0 +1,148 @@
+name: Update SplatTopConfig Image Tags
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Image tag to write, for example v2.0.31.
+        required: true
+        type: string
+      values_files_json:
+        description: JSON array of values files in SplatTopConfig.
+        required: true
+        type: string
+      components_json:
+        description: JSON array of component keys to update.
+        required: true
+        type: string
+      set_global:
+        description: Also update global.appImageTag.
+        required: false
+        type: boolean
+        default: false
+      branch_prefix:
+        required: false
+        type: string
+        default: bot/update-images
+      commit_message:
+        required: false
+        type: string
+        default: "chore: update image tags"
+      pr_title:
+        required: false
+        type: string
+        default: "[bot] Update image tags"
+      pr_body:
+        required: false
+        type: string
+        default: ""
+      bot_name:
+        required: false
+        type: string
+        default: splattop-bot
+      bot_email:
+        required: false
+        type: string
+        default: sre+bot@splattop.dev
+    secrets:
+      CONFIG_REPO_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  update-config:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout config repository
+        uses: actions/checkout@v5
+        with:
+          repository: cesaregarza/SplatTopConfig
+          token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          path: config-repo
+          ref: main
+
+      - name: Install config tooling
+        run: python3 -m pip install --user "ruamel.yaml>=0.18.6,<0.19"
+
+      - name: Update values files
+        id: update
+        env:
+          TAG: ${{ inputs.tag }}
+          VALUES_FILES_JSON: ${{ inputs.values_files_json }}
+          COMPONENTS_JSON: ${{ inputs.components_json }}
+          SET_GLOBAL: ${{ inputs.set_global }}
+          BRANCH: ${{ inputs.branch_prefix }}-${{ github.run_id }}
+          BOT_NAME: ${{ inputs.bot_name }}
+          BOT_EMAIL: ${{ inputs.bot_email }}
+        run: |
+          set -euo pipefail
+          cd config-repo
+          git config user.name "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          git checkout -b "$BRANCH"
+
+          python3 - <<'PY' > /tmp/splattop-config-values-files
+          import json
+          import os
+          import subprocess
+
+          values_files = json.loads(os.environ["VALUES_FILES_JSON"])
+          components = json.loads(os.environ["COMPONENTS_JSON"])
+          tag = os.environ["TAG"]
+          set_global = os.environ["SET_GLOBAL"].lower() == "true"
+
+          if not isinstance(values_files, list) or not values_files:
+              raise SystemExit("values_files_json must be a non-empty JSON array")
+          if not isinstance(components, list) or not components:
+              raise SystemExit("components_json must be a non-empty JSON array")
+
+          for values_file in values_files:
+              cmd = [
+                  "python3",
+                  "scripts/update_config_image_tags.py",
+                  "--values-file",
+                  str(values_file),
+                  "--tag",
+                  tag,
+              ]
+              for component in components:
+                  cmd.extend(["--component", str(component)])
+              if set_global:
+                  cmd.append("--set-global")
+              subprocess.run(cmd, check=True)
+              print(values_file)
+          PY
+
+          xargs -r git add < /tmp/splattop-config-values-files
+          if git diff --cached --quiet; then
+            echo "skip_pr=true" >> "$GITHUB_OUTPUT"
+            echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "${{ inputs.commit_message }} $TAG"
+          git push --set-upstream origin "$BRANCH"
+          echo "skip_pr=false" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Open config repo PR
+        if: steps.update.outputs.skip_pr != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CONFIG_REPO_TOKEN }}
+          BRANCH: ${{ steps.update.outputs.branch }}
+          PR_TITLE: ${{ inputs.pr_title }}
+          PR_BODY: ${{ inputs.pr_body }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          cd config-repo
+          body="${PR_BODY:-Source: ${GITHUB_REPOSITORY}@${GITHUB_SHA}}"
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "$PR_TITLE $TAG" \
+            --body "$body" \
+            || echo "Pull request already exists; continuing."
+
