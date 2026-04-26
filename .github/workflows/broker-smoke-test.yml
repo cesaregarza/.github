@@ -1,0 +1,73 @@
+name: Broker smoke test
+
+on:
+  workflow_call:
+    inputs:
+      broker_url:
+        description: Base broker URL.
+        required: false
+        type: string
+        default: https://credentials.garz.ai
+      audience:
+        description: GitHub OIDC audience expected by the broker.
+        required: false
+        type: string
+        default: https://credentials.garz.ai/v1
+      bundle:
+        description: Broker credential bundle to request.
+        required: false
+        type: string
+        default: github-credential-broker-smoke-test
+      expected_test_token:
+        description: Expected fake smoke-test value.
+        required: false
+        type: string
+        default: test_value
+      print_value:
+        description: Print the returned fake test value.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  smoke:
+    name: Request fake broker credential
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch fake smoke-test credential
+        id: broker
+        uses: cesaregarza/.github/actions/fetch-broker-credentials@main
+        with:
+          broker-url: ${{ inputs.broker_url }}
+          audience: ${{ inputs.audience }}
+          bundle: ${{ inputs.bundle }}
+
+      - name: Assert fake smoke-test credential
+        shell: bash
+        env:
+          SECRETS_JSON: ${{ steps.broker.outputs.secrets-json }}
+          AUDIT_JSON: ${{ steps.broker.outputs.audit }}
+          EXPECTED_TEST_TOKEN: ${{ inputs.expected_test_token }}
+          PRINT_VALUE: ${{ inputs.print_value }}
+        run: |
+          set -euo pipefail
+          value="$(jq -r '.TEST_TOKEN' <<< "$SECRETS_JSON")"
+          echo "::add-mask::$value"
+
+          echo "bundle=${{ steps.broker.outputs.bundle }}"
+          echo "audit=$AUDIT_JSON"
+          echo "value_length=${#value}"
+
+          if [[ "$value" != "$EXPECTED_TEST_TOKEN" ]]; then
+            echo "TEST_TOKEN did not match expected smoke-test value" >&2
+            exit 1
+          fi
+
+          if [[ "$PRINT_VALUE" == "true" ]]; then
+            echo "TEST_TOKEN=$value"
+          fi
+
