@@ -15,7 +15,7 @@ inputs:
     description: JSON array of credential capability names to request.
     required: false
   bundle:
-    description: Deprecated alias for capability.
+    description: Deprecated legacy bundle name to request through /v1/credentials.
     required: false
   export-env:
     description: Write returned secret keys to GITHUB_ENV for later shell steps.
@@ -30,7 +30,7 @@ outputs:
     description: Compact JSON array of capabilities returned by the broker.
     value: ${{ steps.fetch.outputs.capabilities-json }}
   bundle:
-    description: Deprecated alias for capability.
+    description: Deprecated alias for the first returned capability or legacy bundle.
     value: ${{ steps.fetch.outputs.bundle }}
   audit:
     description: Compact JSON audit claims returned by the broker.
@@ -90,29 +90,39 @@ runs:
               end
             ' <<< "$CAPABILITIES_JSON"
           )"
+          response="$(
+            curl -sSf -X POST \
+              -H "Authorization: Bearer $OIDC_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data-binary "$request_body" \
+              "${BROKER_URL%/}/v1/capabilities"
+          )"
+        elif [[ -n "$CAPABILITY" ]]; then
+          if [[ -n "$BUNDLE" ]]; then
+            echo "Use capability or bundle, not both" >&2
+            exit 1
+          fi
+          request_body="$(jq -nc --arg capability "$CAPABILITY" '{capabilities: [$capability]}')"
+          response="$(
+            curl -sSf -X POST \
+              -H "Authorization: Bearer $OIDC_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data-binary "$request_body" \
+              "${BROKER_URL%/}/v1/capabilities"
+          )"
+        elif [[ -n "$BUNDLE" ]]; then
+          response="$(
+            curl -sSf -X POST \
+              -H "Authorization: Bearer $OIDC_TOKEN" \
+              "${BROKER_URL%/}/v1/credentials/${BUNDLE}"
+          )"
         else
-          capability="${CAPABILITY:-$BUNDLE}"
-          if [[ -z "$capability" ]]; then
-            echo "One of capability, capabilities, or bundle is required" >&2
-            exit 1
-          fi
-          if [[ -n "$CAPABILITY" && -n "$BUNDLE" && "$CAPABILITY" != "$BUNDLE" ]]; then
-            echo "capability and bundle inputs must match when both are set" >&2
-            exit 1
-          fi
-          request_body="$(jq -nc --arg capability "$capability" '{capabilities: [$capability]}')"
+          echo "One of capability, capabilities, or bundle is required" >&2
+          exit 1
         fi
 
-        response="$(
-          curl -sSf -X POST \
-            -H "Authorization: Bearer $OIDC_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data-binary "$request_body" \
-            "${BROKER_URL%/}/v1/capabilities"
-        )"
-
-        capability="$(jq -r '.capabilities[0] // empty' <<< "$response")"
-        capabilities_json="$(jq -c '.capabilities' <<< "$response")"
+        capability="$(jq -r 'if (.capabilities | type) == "array" then .capabilities[0] else .bundle // empty end' <<< "$response")"
+        capabilities_json="$(jq -c 'if (.capabilities | type) == "array" then .capabilities else [.bundle] end' <<< "$response")"
         audit="$(jq -c '.audit' <<< "$response")"
         secrets_json="$(jq -c '.secrets' <<< "$response")"
 
