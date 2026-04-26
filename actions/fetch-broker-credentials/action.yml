@@ -1,5 +1,5 @@
 name: Fetch Broker Credentials
-description: Fetch a credential bundle from the GitHub OIDC credential broker.
+description: Fetch credential capabilities from the GitHub OIDC credential broker.
 
 inputs:
   broker-url:
@@ -8,17 +8,29 @@ inputs:
   audience:
     description: GitHub OIDC audience expected by the broker.
     required: true
+  capability:
+    description: Single credential capability name to request.
+    required: false
+  capabilities:
+    description: JSON array of credential capability names to request.
+    required: false
   bundle:
-    description: Credential bundle name to request.
-    required: true
+    description: Deprecated alias for capability.
+    required: false
   export-env:
     description: Write returned secret keys to GITHUB_ENV for later shell steps.
     required: false
     default: "false"
 
 outputs:
+  capability:
+    description: First capability returned by the broker.
+    value: ${{ steps.fetch.outputs.capability }}
+  capabilities-json:
+    description: Compact JSON array of capabilities returned by the broker.
+    value: ${{ steps.fetch.outputs.capabilities-json }}
   bundle:
-    description: Bundle returned by the broker.
+    description: Deprecated alias for capability.
     value: ${{ steps.fetch.outputs.bundle }}
   audit:
     description: Compact JSON audit claims returned by the broker.
@@ -50,35 +62,69 @@ runs:
         echo "::add-mask::$token"
         echo "token=$token" >> "$GITHUB_OUTPUT"
 
-    - name: Fetch credential bundle
+    - name: Fetch credential capabilities
       id: fetch
       shell: bash
       env:
         BROKER_URL: ${{ inputs.broker-url }}
+        CAPABILITY: ${{ inputs.capability }}
+        CAPABILITIES_JSON: ${{ inputs.capabilities }}
         BUNDLE: ${{ inputs.bundle }}
         OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         EXPORT_ENV: ${{ inputs.export-env }}
       run: |
         set -euo pipefail
+        if [[ -n "$CAPABILITIES_JSON" ]]; then
+          if [[ -n "$CAPABILITY" || -n "$BUNDLE" ]]; then
+            echo "Use only one of capabilities, capability, or bundle" >&2
+            exit 1
+          fi
+          request_body="$(
+            jq -e -c '
+              if type != "array" or length == 0 then
+                error("capabilities must be a non-empty JSON array")
+              elif any(.[]; type != "string" or length == 0) then
+                error("capabilities must contain only non-empty strings")
+              else
+                {capabilities: .}
+              end
+            ' <<< "$CAPABILITIES_JSON"
+          )"
+        else
+          capability="${CAPABILITY:-$BUNDLE}"
+          if [[ -z "$capability" ]]; then
+            echo "One of capability, capabilities, or bundle is required" >&2
+            exit 1
+          fi
+          if [[ -n "$CAPABILITY" && -n "$BUNDLE" && "$CAPABILITY" != "$BUNDLE" ]]; then
+            echo "capability and bundle inputs must match when both are set" >&2
+            exit 1
+          fi
+          request_body="$(jq -nc --arg capability "$capability" '{capabilities: [$capability]}')"
+        fi
+
         response="$(
           curl -sSf -X POST \
             -H "Authorization: Bearer $OIDC_TOKEN" \
-            "${BROKER_URL%/}/v1/credentials/${BUNDLE}"
+            -H "Content-Type: application/json" \
+            --data-binary "$request_body" \
+            "${BROKER_URL%/}/v1/capabilities"
         )"
 
-        bundle="$(jq -r '.bundle' <<< "$response")"
+        capability="$(jq -r '.capabilities[0] // empty' <<< "$response")"
+        capabilities_json="$(jq -c '.capabilities' <<< "$response")"
         audit="$(jq -c '.audit' <<< "$response")"
         secrets_json="$(jq -c '.secrets' <<< "$response")"
 
-        if [[ -z "$bundle" || "$bundle" == "null" ]]; then
-          echo "Broker response did not include bundle name" >&2
+        if [[ -z "$capability" ]]; then
+          echo "Broker response did not include capabilities" >&2
           exit 1
         fi
 
         while IFS= read -r value; do
           [[ -z "$value" || "$value" == "null" ]] && continue
           echo "::add-mask::$value"
-        done < <(jq -r '.secrets | to_entries[] | .value' <<< "$response")
+        done < <(jq -r '.secrets | to_entries[]? | .value' <<< "$response")
 
         if [[ "$EXPORT_ENV" == "true" ]]; then
           while IFS=$'\t' read -r key value; do
@@ -91,10 +137,11 @@ runs:
               echo "$value"
               echo "__BROKER_SECRET__"
             } >> "$GITHUB_ENV"
-          done < <(jq -r '.secrets | to_entries[] | [.key, .value] | @tsv' <<< "$response")
+          done < <(jq -r '.secrets | to_entries[]? | [.key, .value] | @tsv' <<< "$response")
         fi
 
-        echo "bundle=$bundle" >> "$GITHUB_OUTPUT"
+        echo "capability=$capability" >> "$GITHUB_OUTPUT"
+        echo "capabilities-json=$capabilities_json" >> "$GITHUB_OUTPUT"
+        echo "bundle=$capability" >> "$GITHUB_OUTPUT"
         echo "audit=$audit" >> "$GITHUB_OUTPUT"
         echo "secrets-json=$secrets_json" >> "$GITHUB_OUTPUT"
-

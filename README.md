@@ -3,8 +3,9 @@
 This repository contains reusable workflows and composite actions for the
 `cesaregarza/*` repositories.
 
-Secrets intentionally stay in the caller repositories or environments. Shared
-workflows declare the secrets they need, and callers pass them explicitly.
+Secrets intentionally stay out of caller repositories and shared workflow
+definitions. Caller jobs use GitHub OIDC to request narrow credential
+capabilities from the credential broker.
 
 ## Reusable Workflows
 
@@ -19,8 +20,8 @@ workflows declare the secrets they need, and callers pass them explicitly.
 ## Composite Actions
 
 - `actions/fetch-broker-credentials` - request a GitHub OIDC token, call the
-  credential broker, mask returned values, and optionally export them to later
-  shell steps.
+  credential broker capability endpoint, mask returned values, and optionally
+  export them to later shell steps.
 - `actions/compute-next-version` - read `.version`, inspect the latest GitHub
   release, and output the next patch version.
 - `actions/setup-docr-buildx` - configure Docker Buildx and log in to
@@ -32,8 +33,16 @@ workflows declare the secrets they need, and callers pass them explicitly.
 
 ```yaml
 jobs:
-  claude:
-    uses: cesaregarza/.github/.github/workflows/claude.yml@main
-    secrets:
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: cesaregarza/.github/actions/fetch-broker-credentials@main
+        with:
+          broker-url: https://credentials.garz.ai
+          audience: https://credentials.garz.ai/v1
+          capability: digitalocean-k8s-deploy
+          export-env: "true"
 ```
