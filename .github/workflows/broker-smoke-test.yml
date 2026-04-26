@@ -13,11 +13,11 @@ on:
         required: false
         type: string
         default: https://credentials.garz.ai/v1
-      bundle:
-        description: Broker credential bundle to request.
+      capability:
+        description: Broker credential capability to request.
         required: false
         type: string
-        default: github-credential-broker-smoke-test
+        default: broker-smoke-test
       expected_test_token:
         description: Expected fake smoke-test value.
         required: false
@@ -44,7 +44,7 @@ jobs:
         with:
           broker-url: ${{ inputs.broker_url }}
           audience: ${{ inputs.audience }}
-          bundle: ${{ inputs.bundle }}
+          capability: ${{ inputs.capability }}
 
       - name: Assert fake smoke-test credential
         shell: bash
@@ -58,7 +58,7 @@ jobs:
           value="$(jq -r '.TEST_TOKEN' <<< "$SECRETS_JSON")"
           echo "::add-mask::$value"
 
-          echo "bundle=${{ steps.broker.outputs.bundle }}"
+          echo "capability=${{ steps.broker.outputs.capability }}"
           echo "audit=$AUDIT_JSON"
           echo "value_length=${#value}"
 
@@ -70,4 +70,3 @@ jobs:
           if [[ "$PRINT_VALUE" == "true" ]]; then
             echo "TEST_TOKEN=$value"
           fi
-
