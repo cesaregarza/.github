@@ -31,6 +31,10 @@ capabilities from the credential broker.
 
 ## Caller Pattern
 
+Callers must grant `id-token: write`; otherwise GitHub will not expose the OIDC
+request environment variables. Keep `secrets-json` inside the same job and do
+not promote it to job outputs.
+
 ```yaml
 jobs:
   deploy:

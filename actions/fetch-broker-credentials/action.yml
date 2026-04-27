@@ -3,7 +3,7 @@ description: Fetch credential capabilities from the GitHub OIDC credential broke
 
 inputs:
   broker-url:
-    description: Base broker URL, for example https://credentials.garz.ai.
+    description: HTTPS base broker URL, for example https://credentials.garz.ai.
     required: true
   audience:
     description: GitHub OIDC audience expected by the broker.
@@ -18,7 +18,7 @@ inputs:
     description: Deprecated legacy bundle name to request through /v1/credentials.
     required: false
   export-env:
-    description: Write returned secret keys to GITHUB_ENV for later shell steps.
+    description: Write returned secret keys to GITHUB_ENV for later steps in the same job. Use with care.
     required: false
     default: "false"
 
@@ -36,32 +36,12 @@ outputs:
     description: Compact JSON audit claims returned by the broker.
     value: ${{ steps.fetch.outputs.audit }}
   secrets-json:
-    description: Compact JSON object of returned secrets.
+    description: Compact JSON object of returned secrets. Sensitive; intended only for same-job use and should not be promoted to job outputs.
     value: ${{ steps.fetch.outputs.secrets-json }}
 
 runs:
   using: composite
   steps:
-    - name: Request GitHub OIDC token
-      id: oidc
-      shell: bash
-      env:
-        AUDIENCE: ${{ inputs.audience }}
-      run: |
-        set -euo pipefail
-        token_json="$(
-          curl -sSf \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}"
-        )"
-        token="$(jq -r .value <<< "$token_json")"
-        if [[ -z "$token" || "$token" == "null" ]]; then
-          echo "GitHub OIDC token response did not include a token" >&2
-          exit 1
-        fi
-        echo "::add-mask::$token"
-        echo "token=$token" >> "$GITHUB_OUTPUT"
-
     - name: Fetch credential capabilities
       id: fetch
       shell: bash
@@ -70,15 +50,130 @@ runs:
         CAPABILITY: ${{ inputs.capability }}
         CAPABILITIES_JSON: ${{ inputs.capabilities }}
         BUNDLE: ${{ inputs.bundle }}
-        OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         EXPORT_ENV: ${{ inputs.export-env }}
       run: |
         set -euo pipefail
-        if [[ -n "$CAPABILITIES_JSON" ]]; then
-          if [[ -n "$CAPABILITY" || -n "$BUNDLE" ]]; then
-            echo "Use only one of capabilities, capability, or bundle" >&2
-            exit 1
+
+        die() {
+          echo "::error::$*" >&2
+          exit 1
+        }
+
+        need() {
+          command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+        }
+
+        uri_encode() {
+          jq -rn --arg v "$1" '$v | @uri'
+        }
+
+        mask_value() {
+          local value="$1"
+          [[ -n "$value" ]] || return 0
+
+          value="${value//'%'/'%25'}"
+          value="${value//$'\r'/'%0D'}"
+          value="${value//$'\n'/'%0A'}"
+          printf '::add-mask::%s\n' "$value"
+        }
+
+        random_delim() {
+          if command -v uuidgen >/dev/null 2>&1; then
+            printf 'BROKER_%s' "$(uuidgen | tr '[:lower:]' '[:upper:]')"
+          else
+            printf 'BROKER_%s' "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
           fi
+        }
+
+        write_multiline_file() {
+          local file="$1"
+          local name="$2"
+          local value="$3"
+          local delim
+
+          while :; do
+            delim="$(random_delim)"
+            if ! grep -qxF "$delim" <<< "$value"; then
+              break
+            fi
+          done
+
+          {
+            printf '%s<<%s\n' "$name" "$delim"
+            printf '%s\n' "$value"
+            printf '%s\n' "$delim"
+          } >> "$file"
+        }
+
+        set_output() {
+          write_multiline_file "$GITHUB_OUTPUT" "$1" "$2"
+        }
+
+        export_secret_env() {
+          local key="$1"
+          local value="$2"
+
+          if ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            die "Cannot export invalid environment key returned by broker: $key"
+          fi
+
+          case "$key" in
+            GITHUB_*|RUNNER_*|ACTIONS_*|NODE_OPTIONS)
+              die "Refusing to export reserved or restricted environment key returned by broker: $key"
+              ;;
+          esac
+
+          write_multiline_file "$GITHUB_ENV" "$key" "$value"
+        }
+
+        need curl
+        need jq
+
+        [[ -n "${BROKER_URL:-}" ]] || die "broker-url input is required"
+        [[ -n "${AUDIENCE:-}" ]] || die "audience input is required"
+
+        case "$BROKER_URL" in
+          https://*) ;;
+          *) die "broker-url must use https://" ;;
+        esac
+
+        export_env_lc="$(printf '%s' "${EXPORT_ENV:-false}" | tr '[:upper:]' '[:lower:]')"
+        case "$export_env_lc" in
+          true|false) ;;
+          *) die "export-env must be true or false" ;;
+        esac
+
+        provided=()
+        [[ -n "${CAPABILITIES_JSON:-}" ]] && provided+=("capabilities")
+        [[ -n "${CAPABILITY:-}" ]] && provided+=("capability")
+        [[ -n "${BUNDLE:-}" ]] && provided+=("bundle")
+
+        if (( ${#provided[@]} != 1 )); then
+          die "Exactly one of capabilities, capability, or bundle is required"
+        fi
+
+        [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]] ||
+          die "ACTIONS_ID_TOKEN_REQUEST_URL is not set. Did the workflow grant permissions: id-token: write?"
+        [[ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]] ||
+          die "ACTIONS_ID_TOKEN_REQUEST_TOKEN is not set. Did the workflow grant permissions: id-token: write?"
+
+        audience_q="$(uri_encode "$AUDIENCE")"
+        token_json="$(
+          curl --silent --show-error --fail-with-body \
+            --connect-timeout 10 --max-time 60 \
+            --retry 3 --retry-all-errors \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience_q}"
+        )"
+
+        oidc_token="$(
+          jq -er '.value | select(type == "string" and length > 0)' <<< "$token_json"
+        )" || die "GitHub OIDC token response did not include a token"
+        mask_value "$oidc_token"
+
+        broker_base="${BROKER_URL%/}"
+
+        if [[ -n "$CAPABILITIES_JSON" ]]; then
           request_body="$(
             jq -e -c '
               if type != "array" or length == 0 then
@@ -91,67 +186,86 @@ runs:
             ' <<< "$CAPABILITIES_JSON"
           )"
           response="$(
-            curl -sSf -X POST \
-              -H "Authorization: Bearer $OIDC_TOKEN" \
+            curl --silent --show-error --fail-with-body \
+              --connect-timeout 10 --max-time 60 \
+              --retry 3 --retry-all-errors \
+              -X POST \
+              -H "Authorization: Bearer $oidc_token" \
               -H "Content-Type: application/json" \
               --data-binary "$request_body" \
-              "${BROKER_URL%/}/v1/capabilities"
+              "${broker_base}/v1/capabilities"
           )"
         elif [[ -n "$CAPABILITY" ]]; then
-          if [[ -n "$BUNDLE" ]]; then
-            echo "Use capability or bundle, not both" >&2
-            exit 1
-          fi
           request_body="$(jq -nc --arg capability "$CAPABILITY" '{capabilities: [$capability]}')"
           response="$(
-            curl -sSf -X POST \
-              -H "Authorization: Bearer $OIDC_TOKEN" \
+            curl --silent --show-error --fail-with-body \
+              --connect-timeout 10 --max-time 60 \
+              --retry 3 --retry-all-errors \
+              -X POST \
+              -H "Authorization: Bearer $oidc_token" \
               -H "Content-Type: application/json" \
               --data-binary "$request_body" \
-              "${BROKER_URL%/}/v1/capabilities"
-          )"
-        elif [[ -n "$BUNDLE" ]]; then
-          response="$(
-            curl -sSf -X POST \
-              -H "Authorization: Bearer $OIDC_TOKEN" \
-              "${BROKER_URL%/}/v1/credentials/${BUNDLE}"
+              "${broker_base}/v1/capabilities"
           )"
         else
-          echo "One of capability, capabilities, or bundle is required" >&2
-          exit 1
+          bundle_q="$(uri_encode "$BUNDLE")"
+          response="$(
+            curl --silent --show-error --fail-with-body \
+              --connect-timeout 10 --max-time 60 \
+              --retry 3 --retry-all-errors \
+              -X POST \
+              -H "Authorization: Bearer $oidc_token" \
+              "${broker_base}/v1/credentials/${bundle_q}"
+          )"
         fi
+
+        jq -e '
+          (.secrets | type == "object")
+          and all(.secrets[]; type == "string")
+          and (
+            (
+              (.capabilities | type == "array")
+              and (.capabilities | length > 0)
+              and all(.capabilities[]; type == "string" and length > 0)
+            )
+            or
+            (
+              (.bundle | type == "string")
+              and (.bundle | length > 0)
+            )
+          )
+        ' <<< "$response" >/dev/null ||
+          die "Broker response did not match expected schema"
 
         capability="$(jq -r 'if (.capabilities | type) == "array" then .capabilities[0] else .bundle // empty end' <<< "$response")"
         capabilities_json="$(jq -c 'if (.capabilities | type) == "array" then .capabilities else [.bundle] end' <<< "$response")"
-        audit="$(jq -c '.audit' <<< "$response")"
+        audit="$(jq -c '.audit // {}' <<< "$response")"
         secrets_json="$(jq -c '.secrets' <<< "$response")"
 
-        if [[ -z "$capability" ]]; then
-          echo "Broker response did not include capabilities" >&2
-          exit 1
+        while IFS= read -r encoded_entry; do
+          value="$(
+            jq -r -n --arg e "$encoded_entry" \
+              '$e | @base64d | fromjson | .value'
+          )"
+          mask_value "$value"
+        done < <(jq -r '.secrets | to_entries[] | @base64' <<< "$response")
+
+        if [[ "$export_env_lc" == "true" ]]; then
+          while IFS= read -r encoded_entry; do
+            key="$(
+              jq -r -n --arg e "$encoded_entry" \
+                '$e | @base64d | fromjson | .key'
+            )"
+            value="$(
+              jq -r -n --arg e "$encoded_entry" \
+                '$e | @base64d | fromjson | .value'
+            )"
+            export_secret_env "$key" "$value"
+          done < <(jq -r '.secrets | to_entries[] | @base64' <<< "$response")
         fi
 
-        while IFS= read -r value; do
-          [[ -z "$value" || "$value" == "null" ]] && continue
-          echo "::add-mask::$value"
-        done < <(jq -r '.secrets | to_entries[]? | .value' <<< "$response")
-
-        if [[ "$EXPORT_ENV" == "true" ]]; then
-          while IFS=$'\t' read -r key value; do
-            if ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-              echo "Cannot export invalid environment key returned by broker: $key" >&2
-              exit 1
-            fi
-            {
-              echo "${key}<<__BROKER_SECRET__"
-              echo "$value"
-              echo "__BROKER_SECRET__"
-            } >> "$GITHUB_ENV"
-          done < <(jq -r '.secrets | to_entries[]? | [.key, .value] | @tsv' <<< "$response")
-        fi
-
-        echo "capability=$capability" >> "$GITHUB_OUTPUT"
-        echo "capabilities-json=$capabilities_json" >> "$GITHUB_OUTPUT"
-        echo "bundle=$capability" >> "$GITHUB_OUTPUT"
-        echo "audit=$audit" >> "$GITHUB_OUTPUT"
-        echo "secrets-json=$secrets_json" >> "$GITHUB_OUTPUT"
+        set_output "capability" "$capability"
+        set_output "capabilities-json" "$capabilities_json"
+        set_output "bundle" "$capability"
+        set_output "audit" "$audit"
+        set_output "secrets-json" "$secrets_json"
