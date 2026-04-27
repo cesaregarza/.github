@@ -47,6 +47,7 @@ runs:
       shell: bash
       env:
         BROKER_URL: ${{ inputs.broker-url }}
+        AUDIENCE: ${{ inputs.audience }}
         CAPABILITY: ${{ inputs.capability }}
         CAPABILITIES_JSON: ${{ inputs.capabilities }}
         BUNDLE: ${{ inputs.bundle }}
